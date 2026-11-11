@@ -6,12 +6,11 @@ import {
   getCheckpoint,
   removeCheckpoint
 } from '../utils/storageEngine';
-
-const INITIAL_CHUNK_SIZE = 64 * 1024; // 64KB universal sweet spot for SCTP packetization
-const HIGH_BUFFER_THRESHOLD = 1024 * 1024; // 1MB buffer ceiling for smooth backpressure pacing
+import { getDeviceProfile } from '../utils/deviceProfile';
 
 export default function useFileTransfer({
   channelRef,
+  channelsRef,
   addLog,
   setErrorMsg,
   cleanupWebRTC
@@ -48,6 +47,8 @@ export default function useFileTransfer({
   const receiverBytesReceived = useRef(0);
   const receiverSpeedSampleTime = useRef(0);
   const receiverSpeedSampleBytes = useRef(0);
+
+  const deviceProfile = getDeviceProfile();
 
   const setTransferringFileWithRef = (val) => {
     setTransferringFile(val);
@@ -103,8 +104,9 @@ export default function useFileTransfer({
     addLog('Pausing file transfer...', 'info');
     isPausedRef.current = true;
     setIsPaused(true);
-    if (channelRef.current && channelRef.current.readyState === 'open') {
-      channelRef.current.send(JSON.stringify({ type: 'pause' }));
+    const primary = channelRef.current;
+    if (primary && primary.readyState === 'open') {
+      primary.send(JSON.stringify({ type: 'pause' }));
     }
   }, [addLog, channelRef]);
 
@@ -113,8 +115,9 @@ export default function useFileTransfer({
     addLog('Resuming file transfer...', 'info');
     isPausedRef.current = false;
     setIsPaused(false);
-    if (channelRef.current && channelRef.current.readyState === 'open') {
-      channelRef.current.send(JSON.stringify({ type: 'resume' }));
+    const primary = channelRef.current;
+    if (primary && primary.readyState === 'open') {
+      primary.send(JSON.stringify({ type: 'resume' }));
     }
     if (pauseResolverRef.current) {
       pauseResolverRef.current();
@@ -126,8 +129,9 @@ export default function useFileTransfer({
     addLog('Cancelling active file transfer...', 'warning');
     isCancelled.current = true;
 
-    if (channelRef.current && channelRef.current.readyState === 'open') {
-      channelRef.current.send(JSON.stringify({ type: 'cancel' }));
+    const primary = channelRef.current;
+    if (primary && primary.readyState === 'open') {
+      primary.send(JSON.stringify({ type: 'cancel' }));
     }
 
     if (storageEngineRef.current) {
@@ -163,7 +167,7 @@ export default function useFileTransfer({
     isPausedRef.current = false;
     setIsPaused(false);
 
-    addLog(`Initiating transfer of ${list.length} file(s)...`, 'info');
+    addLog(`Initiating high-throughput transfer of ${list.length} file(s)...`, 'info');
 
     for (let i = 0; i < list.length; i++) {
       if (isCancelled.current) break;
@@ -184,7 +188,7 @@ export default function useFileTransfer({
       setTransferSpeed('0.00');
       setTransferEta('--');
 
-      addLog(`Broadcasting file metadata for "${safeName}" (${formatBytes(file.size)})`, 'info');
+      addLog(`Broadcasting metadata for "${safeName}" (${formatBytes(file.size)})`, 'info');
 
       const metadata = {
         type: 'metadata',
@@ -195,16 +199,17 @@ export default function useFileTransfer({
         lastModified: file.lastModified || 0
       };
 
-      if (!channelRef.current || channelRef.current.readyState !== 'open') {
-        addLog('Aborted transfer: DataChannel not connected.', 'error');
+      const primaryChannel = channelRef.current;
+      if (!primaryChannel || primaryChannel.readyState !== 'open') {
+        addLog('Aborted transfer: Primary DataChannel not connected.', 'error');
         resetTransferStates();
         return;
       }
-      channelRef.current.send(JSON.stringify(metadata));
+      primaryChannel.send(JSON.stringify(metadata));
 
       let resumeOffset = 0;
       try {
-        addLog('Waiting for peer confirmation / save dialog...', 'info');
+        addLog('Waiting for peer confirmation...', 'info');
         const readyPacket = await new Promise((resolve, reject) => {
           readyResolver.current = { resolve, reject };
         });
@@ -228,7 +233,10 @@ export default function useFileTransfer({
       const initialPercent = file.size > 0 ? Math.floor((bytesSent / file.size) * 100) : 0;
       setTransferProgress(initialPercent);
 
-      // Adaptive chunk slicing loop
+      // Adaptive Dynamic Sizing (AIMD) & Channel Striping
+      let currentChunkSize = deviceProfile.initialChunkSize;
+      let chunkCounter = 0;
+
       while (offset < file.size) {
         if (isCancelled.current) {
           addLog('Transfer cancelled during streaming.', 'warning');
@@ -242,40 +250,58 @@ export default function useFileTransfer({
           });
         }
 
-        if (!channelRef.current || channelRef.current.readyState !== 'open') {
-          addLog('Aborted: DataChannel disconnected during transmission.', 'error');
+        // Retrieve available striped channels
+        const availableChannels =
+          channelsRef?.current?.filter((c) => c.readyState === 'open') ||
+          [channelRef.current].filter(Boolean);
+
+        if (availableChannels.length === 0) {
+          addLog('Aborted: All DataChannels disconnected.', 'error');
           resetTransferStates();
           return;
         }
 
-        // Backpressure pacing: pause if buffer is saturated
-        if (channelRef.current.bufferedAmount > HIGH_BUFFER_THRESHOLD) {
+        // Pick next striped channel
+        const targetChannel = availableChannels[chunkCounter % availableChannels.length];
+        chunkCounter++;
+
+        // Backpressure monitoring with AIMD dynamic chunk tuning
+        if (targetChannel.bufferedAmount > deviceProfile.highBufferThreshold) {
+          // Multiplicative decrease (scale down chunk size)
+          currentChunkSize = Math.max(
+            deviceProfile.minChunkSize,
+            Math.floor(currentChunkSize * 0.75)
+          );
           await new Promise((resolve) => {
             resolveBufferedAmountLow.current = resolve;
           });
+        } else if (targetChannel.bufferedAmount < deviceProfile.lowBufferThreshold) {
+          // Additive increase (scale up chunk size)
+          currentChunkSize = Math.min(
+            deviceProfile.maxChunkSize,
+            currentChunkSize + 4 * 1024
+          );
         }
 
-        const currentChunkSize = INITIAL_CHUNK_SIZE;
         const end = Math.min(offset + currentChunkSize, file.size);
 
         try {
-          // Zero-overhead slice
           const chunkBuffer = await file.slice(offset, end).arrayBuffer();
 
-          // Packet structure: 8 bytes BigInt64 offset + chunk bytes
+          // 8-byte BigInt64 offset + payload
           const packet = new Uint8Array(8 + chunkBuffer.byteLength);
           const view = new DataView(packet.buffer);
           view.setBigUint64(0, BigInt(offset));
           packet.set(new Uint8Array(chunkBuffer), 8);
 
-          channelRef.current.send(packet.buffer);
+          targetChannel.send(packet.buffer);
           bytesSent += (end - offset);
           offset = end;
 
           const percent = Math.floor((bytesSent / file.size) * 100);
           setTransferProgress(percent);
 
-          // Real-time speed and ETA calculation
+          // Real-time speed and ETA sampling
           const now = Date.now();
           const timeDelta = (now - lastSpeedSampleTime.current) / 1000;
           if (timeDelta >= 0.25) {
@@ -292,7 +318,7 @@ export default function useFileTransfer({
             lastSpeedSampleBytes.current = bytesSent;
           }
 
-          // Yield execution to the browser to keep UI at 60fps
+          // Yield execution to preserve 60fps UI
           await new Promise((r) => setTimeout(r, 0));
         } catch (err) {
           addLog(`Error slicing file segment: ${err.message}`, 'error');
@@ -303,8 +329,8 @@ export default function useFileTransfer({
 
       if (isCancelled.current) break;
 
-      addLog(`File "${safeName}" fully sent. Awaiting receiver acknowledgment...`, 'info');
-      channelRef.current.send(JSON.stringify({ type: 'eof', fileId }));
+      addLog(`File "${safeName}" fully streamed. Emitting EOF to primary channel...`, 'info');
+      primaryChannel.send(JSON.stringify({ type: 'eof', fileId }));
 
       await new Promise((resolve) => {
         ackResolver.current = resolve;
@@ -340,7 +366,9 @@ export default function useFileTransfer({
         mimeType: fileMeta.mimeType,
         direction: 'receiving'
       });
-      setTransferProgress(fileMeta.size > 0 ? Math.floor((actualResumeOffset / fileMeta.size) * 100) : 0);
+      setTransferProgress(
+        fileMeta.size > 0 ? Math.floor((actualResumeOffset / fileMeta.size) * 100) : 0
+      );
       setTransferSpeed('0.00');
       setTransferEta('--');
 
@@ -349,8 +377,9 @@ export default function useFileTransfer({
       receiverSpeedSampleTime.current = Date.now();
       receiverSpeedSampleBytes.current = actualResumeOffset;
 
-      if (channelRef.current && channelRef.current.readyState === 'open') {
-        channelRef.current.send(
+      const primary = channelRef.current;
+      if (primary && primary.readyState === 'open') {
+        primary.send(
           JSON.stringify({
             type: 'ready',
             fileId: fileMeta.fileId,
@@ -362,13 +391,15 @@ export default function useFileTransfer({
     } catch (err) {
       if (err.name === 'AbortError') {
         addLog('User cancelled save directory selection.', 'warning');
-        if (channelRef.current && channelRef.current.readyState === 'open') {
-          channelRef.current.send(JSON.stringify({ type: 'error', message: 'User aborted save' }));
+        const primary = channelRef.current;
+        if (primary && primary.readyState === 'open') {
+          primary.send(JSON.stringify({ type: 'error', message: 'User aborted save' }));
         }
       } else {
         addLog(`Storage engine initialization failed: ${err.message}`, 'error');
-        if (channelRef.current && channelRef.current.readyState === 'open') {
-          channelRef.current.send(JSON.stringify({ type: 'error', message: err.message }));
+        const primary = channelRef.current;
+        if (primary && primary.readyState === 'open') {
+          primary.send(JSON.stringify({ type: 'error', message: err.message }));
         }
       }
       resetTransferStates();
@@ -379,8 +410,9 @@ export default function useFileTransfer({
   const handleDeclineFile = () => {
     if (!pendingIncomingFile) return;
     addLog(`User declined incoming file: "${pendingIncomingFile.name}"`, 'warning');
-    if (channelRef.current && channelRef.current.readyState === 'open') {
-      channelRef.current.send(JSON.stringify({ type: 'error', message: 'User declined transfer' }));
+    const primary = channelRef.current;
+    if (primary && primary.readyState === 'open') {
+      primary.send(JSON.stringify({ type: 'error', message: 'User declined transfer' }));
     }
     setPendingIncomingFile(null);
   };
@@ -450,7 +482,8 @@ export default function useFileTransfer({
           }
         } else if (packet.type === 'metadata') {
           const safeName = sanitizeFileName(packet.name);
-          const fileId = packet.fileId || generateFileId(safeName, packet.size, packet.lastModified);
+          const fileId =
+            packet.fileId || generateFileId(safeName, packet.size, packet.lastModified);
           const meta = {
             ...packet,
             name: safeName,
@@ -459,12 +492,17 @@ export default function useFileTransfer({
 
           addLog(`Incoming file request: "${safeName}" (${formatBytes(packet.size)})`, 'info');
 
-          // Check for existing partial checkpoint to offer resumption
+          // Check for existing partial checkpoint
           const checkpoint = await getCheckpoint(fileId);
           if (checkpoint && checkpoint.bytesReceived > 0 && checkpoint.bytesReceived < packet.size) {
             meta.resumeOffset = checkpoint.bytesReceived;
             meta.isResume = true;
-            addLog(`Found previous partial transfer! Can resume from ${formatBytes(checkpoint.bytesReceived)}.`, 'success');
+            addLog(
+              `Found previous partial transfer! Can resume from ${formatBytes(
+                checkpoint.bytesReceived
+              )}.`,
+              'success'
+            );
           }
 
           setPendingIncomingFile(meta);
@@ -473,7 +511,8 @@ export default function useFileTransfer({
             try {
               addLog('EOF received. Finalizing file download...', 'info');
               await storageEngineRef.current.finalize();
-              channelRef.current?.send(JSON.stringify({ type: 'ack', fileId: packet.fileId }));
+              const primary = channelRef.current;
+              primary?.send(JSON.stringify({ type: 'ack', fileId: packet.fileId }));
               setTransferProgress(100);
               setTransferringFileWithRef(null);
               storageEngineRef.current = null;
@@ -487,7 +526,7 @@ export default function useFileTransfer({
         addLog(`Malformed packet received: ${event.data}`, 'warning');
       }
     } else {
-      // Binary chunk packet
+      // Binary chunk packet (can arrive on ANY striped channel!)
       const buffer = event.data;
       if (!buffer || buffer.byteLength < 8) return;
 
@@ -527,7 +566,9 @@ export default function useFileTransfer({
         }
       } catch (err) {
         addLog(`Disk write error: ${err.message}`, 'error');
-        channelRef.current?.send(JSON.stringify({ type: 'error', message: 'Storage write failed' }));
+        channelRef.current?.send(
+          JSON.stringify({ type: 'error', message: 'Storage write failed' })
+        );
         cleanupWebRTC?.();
       }
     }

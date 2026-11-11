@@ -8,7 +8,8 @@ export default function ConnectionStatus({
   role,
   webrtcState,
   dataChannelStatus,
-  connectionType
+  connectionType,
+  activeChannelCount
 }) {
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
@@ -108,7 +109,7 @@ export default function ConnectionStatus({
             <div className="info-item connection-type-item">
               <span className="label">Channel:</span>
               <span className="value font-bold connection-type-value">
-                {connectionType} (End-to-End Encrypted)
+                {connectionType} {activeChannelCount > 1 ? `(${activeChannelCount}x Striped)` : '(Safe Fail-Safe)'}
               </span>
             </div>
           )}

@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { getDeviceProfile } from '../utils/deviceProfile';
 
 const PC_CONFIG = {
   iceServers: [
@@ -21,8 +22,6 @@ const PC_CONFIG = {
   rtcpMuxPolicy: 'require'
 };
 
-const BUFFER_LOW_THRESHOLD = 256 * 1024; // 256KB safe low water-mark for reliable backpressure pacing
-
 export default function useWebRTC({
   role,
   sendIceCandidate,
@@ -34,37 +33,44 @@ export default function useWebRTC({
   const [webrtcState, setWebrtcState] = useState('new');
   const [dataChannelStatus, setDataChannelStatus] = useState('closed');
   const [connectionType, setConnectionType] = useState('Determining...');
+  const [activeChannelCount, setActiveChannelCount] = useState(0);
 
   const pcRef = useRef(null);
-  const channelRef = useRef(null);
+  const channelRef = useRef(null); // primary control channel
+  const channelsRef = useRef([]); // striped channel pool
   const pendingCandidates = useRef([]);
   const statsIntervalRef = useRef(null);
 
+  const deviceProfile = getDeviceProfile();
+
   const cleanupWebRTC = () => {
     addLog('Cleaning up WebRTC connections...', 'info');
-    
+
     if (statsIntervalRef.current) {
       clearInterval(statsIntervalRef.current);
       statsIntervalRef.current = null;
     }
     setConnectionType('Determining...');
 
-    if (channelRef.current) {
+    channelsRef.current.forEach((ch) => {
       try {
-        channelRef.current.close();
-      } catch (e) {}
-      channelRef.current = null;
-    }
+        ch.close();
+      } catch {}
+    });
+    channelsRef.current = [];
+    channelRef.current = null;
+    setActiveChannelCount(0);
+
     if (pcRef.current) {
       try {
         pcRef.current.close();
-      } catch (e) {}
+      } catch {}
       pcRef.current = null;
     }
     setDataChannelStatus('closed');
     setWebrtcState('new');
     pendingCandidates.current = [];
-    
+
     onConnectionClosed?.();
   };
 
@@ -83,7 +89,7 @@ export default function useWebRTC({
 
   const startConnectionTypePoll = (pc) => {
     if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
-    
+
     statsIntervalRef.current = setInterval(async () => {
       if (!pc || pc.connectionState !== 'connected') return;
 
@@ -111,10 +117,11 @@ export default function useWebRTC({
             const remoteCandidateReport = stats.get(pairReport.remoteCandidateId);
             const localCandidateReport = stats.get(pairReport.localCandidateId);
 
-            const isRelay = (localCandidateReport && localCandidateReport.candidateType === 'relay') ||
-                            (remoteCandidateReport && remoteCandidateReport.candidateType === 'relay');
+            const isRelay =
+              (localCandidateReport && localCandidateReport.candidateType === 'relay') ||
+              (remoteCandidateReport && remoteCandidateReport.candidateType === 'relay');
 
-            setConnectionType(isRelay ? 'Relayed (TURN)' : 'Direct (STUN)');
+            setConnectionType(isRelay ? 'Relayed (Encrypted Relay)' : 'Direct P2P (High-Speed)');
           }
         }
       } catch (e) {
@@ -124,31 +131,47 @@ export default function useWebRTC({
   };
 
   const setupDataChannel = (channel) => {
-    channelRef.current = channel;
+    if (!channelsRef.current.includes(channel)) {
+      channelsRef.current.push(channel);
+    }
+    if (!channelRef.current || channel.label === 'noshare-ch-0') {
+      channelRef.current = channel;
+    }
+
     channel.binaryType = 'arraybuffer';
-    channel.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
+    channel.bufferedAmountLowThreshold = deviceProfile.lowBufferThreshold;
 
     channel.onopen = () => {
+      const openCount = channelsRef.current.filter((c) => c.readyState === 'open').length;
+      setActiveChannelCount(openCount);
       setDataChannelStatus('open');
-      addLog('RTCDataChannel is OPEN and ready for transfer!', 'success');
+      addLog(
+        `RTCDataChannel [${channel.label}] OPEN (${openCount} channel${openCount > 1 ? 's striped' : ''}).`,
+        'success'
+      );
     };
 
     channel.onclose = () => {
-      setDataChannelStatus('closed');
-      addLog('RTCDataChannel has been closed.', 'warning');
-      cleanupWebRTC();
+      channelsRef.current = channelsRef.current.filter((c) => c !== channel);
+      const openCount = channelsRef.current.filter((c) => c.readyState === 'open').length;
+      setActiveChannelCount(openCount);
+      if (openCount === 0) {
+        setDataChannelStatus('closed');
+        channelRef.current = null;
+        cleanupWebRTC();
+      }
     };
 
     channel.onerror = (error) => {
-      addLog(`RTCDataChannel error: ${error.message || 'unknown error'}`, 'error');
+      addLog(`RTCDataChannel [${channel.label}] error: ${error.message || 'unknown error'}`, 'error');
     };
 
     channel.onbufferedamountlow = () => {
-      onBufferedAmountLow?.();
+      onBufferedAmountLow?.(channel);
     };
 
     channel.onmessage = (event) => {
-      onDataChannelMessage?.(event);
+      onDataChannelMessage?.(event, channel);
     };
   };
 
@@ -179,7 +202,7 @@ export default function useWebRTC({
     pc.oniceconnectionstatechange = () => {
       addLog(`ICE Connection State: ${pc.iceConnectionState}`, 'info');
       if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
-        addLog('ICE Connection dropped. Aborting transfer...', 'error');
+        addLog('ICE Connection dropped. Attempting recovery...', 'error');
         cleanupWebRTC();
       }
     };
@@ -190,7 +213,7 @@ export default function useWebRTC({
       if (pc.connectionState === 'connected') {
         startConnectionTypePoll(pc);
       } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        addLog('Connection disconnected. Aborting transfer...', 'error');
+        addLog('Connection disconnected.', 'error');
         cleanupWebRTC();
       }
     };
@@ -202,11 +225,20 @@ export default function useWebRTC({
     };
 
     if (currentRole === 'host') {
-      const channel = pc.createDataChannel('noshare-channel', { ordered: true });
-      setupDataChannel(channel);
+      const count = deviceProfile.channelCount;
+      addLog(
+        `Configuring ${count} DataChannel(s) [Mode: ${
+          deviceProfile.isLowEnd ? 'Mobile Fail-Safe' : 'High-Throughput Striped'
+        }]...`,
+        'info'
+      );
+      for (let i = 0; i < count; i++) {
+        const channel = pc.createDataChannel(`noshare-ch-${i}`, { ordered: true });
+        setupDataChannel(channel);
+      }
     } else {
       pc.ondatachannel = (event) => {
-        addLog('Inbound RTCDataChannel established with peer.', 'success');
+        addLog(`Inbound DataChannel [${event.channel.label}] received from peer.`, 'success');
         setupDataChannel(event.channel);
       };
     }
@@ -236,8 +268,10 @@ export default function useWebRTC({
     webrtcState,
     dataChannelStatus,
     connectionType,
+    activeChannelCount,
     pcRef,
     channelRef,
+    channelsRef,
     pendingCandidates,
     initPeerConnection,
     cleanupWebRTC,

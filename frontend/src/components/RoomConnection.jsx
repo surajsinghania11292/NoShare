@@ -205,8 +205,10 @@ export default function RoomConnection() {
     webrtcState,
     dataChannelStatus,
     connectionType,
+    activeChannelCount,
     pcRef,
     channelRef,
+    channelsRef,
     pendingCandidates,
     initPeerConnection,
     cleanupWebRTC,
@@ -224,6 +226,7 @@ export default function RoomConnection() {
   // Instantiate File Transfer Hook
   const fileTransfer = useFileTransfer({
     channelRef,
+    channelsRef,
     addLog,
     setErrorMsg,
     cleanupWebRTC
@@ -331,6 +334,7 @@ export default function RoomConnection() {
         webrtcState={webrtcState}
         dataChannelStatus={dataChannelStatus}
         connectionType={connectionType}
+        activeChannelCount={activeChannelCount}
       />
 
       {dataChannelStatus === 'open' && (
