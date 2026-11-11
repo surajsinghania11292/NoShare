@@ -116,6 +116,14 @@ export const registerSignalHandlers = (io) => {
       }
     });
 
+    // WebRTC Signaling Pass-through: Renegotiate / ICE Restart
+    socket.on('renegotiate', () => {
+      const roomCode = socket.roomCode;
+      if (roomCode) {
+        socket.to(roomCode).emit('renegotiate');
+      }
+    });
+
     // Explicit leave handler (e.g. Tab close or click leave room button)
     socket.on('leave-room', () => {
       const roomCode = socket.roomCode;

@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import useSocket from '../hooks/useSocket';
 import useWebRTC from '../hooks/useWebRTC';
 import useFileTransfer from '../hooks/useFileTransfer';
@@ -11,14 +11,12 @@ import FileDropZone from './FileDropZone';
 import FileQueueList from './FileQueueList';
 
 export default function RoomConnection() {
-  // UI and connection state
   const [roomCode, setRoomCode] = useState('');
   const [status, setStatus] = useState('disconnected'); // disconnected, joining, joined-waiting, ready, full
-  const [role, setRole] = useState(null); // 'host' (sender) or 'guest' (receiver)
+  const [role, setRole] = useState(null); // 'host' or 'guest' (used for SDP negotiation only)
   const [joinedRoom, setJoinedRoom] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [dragActive, setDragActive] = useState(false);
-  const [isLegacyMode] = useState(!window.showSaveFilePicker);
 
   const roleRef = useRef(null);
   const joinedRoomRef = useRef('');
@@ -35,50 +33,51 @@ export default function RoomConnection() {
     joinedRoomRef.current = val;
   };
 
-  // Helper to log signaling and flow messages
   const addLog = useCallback((message, type = 'info') => {
     console.log(`[${type.toUpperCase()}] ${message}`);
   }, []);
 
-  // Proxy actions that delegate to the hooks
+  // Socket proxies
   const sendIceCandidate = (candidate) => socketRef.current?.sendIceCandidate(candidate);
   const sendOffer = (offer) => socketRef.current?.sendOffer(offer);
   const sendAnswer = (answer) => socketRef.current?.sendAnswer(answer);
-  const joinRoom = (roomCode) => socketRef.current?.joinRoom(roomCode);
+  const joinRoom = (code) => socketRef.current?.joinRoom(code);
   const leaveRoom = () => socketRef.current?.leaveRoom();
 
   const handleDataChannelMessage = (event) => fileTransferRef.current?.handleDataChannelMessage(event);
   const resetTransferStates = () => fileTransferRef.current?.resetTransferStates();
   const handleBufferedAmountLow = () => fileTransferRef.current?.handleBufferedAmountLow();
 
-  // Socket event handlers
+  // Socket event callbacks
   const handleConnect = useCallback(() => {
-    addLog(`Connected to signaling server`, 'success');
+    addLog('Connected to signaling server', 'success');
+    setErrorMsg('');
     if (joinedRoomRef.current) {
-      addLog(`Reconnecting to room ${joinedRoomRef.current} as ${roleRef.current}...`, 'info');
+      addLog(`Reconnecting to room ${joinedRoomRef.current}...`, 'info');
       socketRef.current?.joinRoom({ roomCode: joinedRoomRef.current, role: roleRef.current });
     }
   }, [addLog]);
 
-  const handleConnectError = useCallback((error) => {
-    addLog(`Connection error: ${error.message}`, 'error');
-    setErrorMsg('Failed to connect to signaling server.');
-    setStatus('disconnected');
+  const handleConnectError = useCallback((error, attempts) => {
+    addLog(`Signaling attempt ${attempts} waiting: ${error.message}`, 'warning');
+    if (attempts >= 5) {
+      setErrorMsg('Signaling server is taking longer than expected. If Render is waking up, it will connect shortly.');
+    }
   }, [addLog]);
 
-  const handleRoomJoined = useCallback(({ role, roomCode }) => {
-    setRoleAndRef(role);
-    setJoinedRoomAndRef(roomCode);
-    setStatus(role === 'host' ? 'joined-waiting' : 'ready');
+  const handleRoomJoined = useCallback(({ role: assignedRole, roomCode: assignedRoom }) => {
+    setRoleAndRef(assignedRole);
+    setJoinedRoomAndRef(assignedRoom);
+    setStatus(assignedRole === 'host' ? 'joined-waiting' : 'ready');
     setErrorMsg('');
-    addLog(`Joined room ${roomCode} as ${role.toUpperCase()}`, 'success');
+    addLog(`Room ${assignedRoom} joined successfully as ${assignedRole.toUpperCase()}.`, 'success');
   }, [addLog]);
 
   const handleReady = useCallback(async () => {
     setStatus('ready');
     setErrorMsg('');
-    addLog('Both peers are connected to the room. Initiating WebRTC Handshake.', 'success');
-    
+    addLog('Both peers are active in the room. Starting WebRTC handshake...', 'success');
+
     if (roleRef.current === 'host') {
       const pc = initPeerConnection(roleRef.current);
       try {
@@ -93,7 +92,7 @@ export default function RoomConnection() {
 
   const handleOffer = useCallback(async (offer) => {
     setErrorMsg('');
-    addLog('SDP Offer received from peer.', 'success');
+    addLog('SDP Offer received from peer. Creating answer...', 'success');
     const pc = initPeerConnection(roleRef.current);
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -108,14 +107,14 @@ export default function RoomConnection() {
   }, [addLog]);
 
   const handleAnswer = useCallback(async (answer) => {
-    addLog('SDP Answer received from peer.', 'success');
+    addLog('SDP Answer received from peer. Setting remote description...', 'success');
     const pc = pcRef.current;
     if (!pc) return;
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
       await processPendingCandidates();
     } catch (err) {
-      addLog(`Error setting Remote Description (Answer): ${err.message}`, 'error');
+      addLog(`Error setting Remote Description: ${err.message}`, 'error');
     }
   }, [addLog]);
 
@@ -125,49 +124,54 @@ export default function RoomConnection() {
       try {
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (err) {
-        addLog(`Error adding remote ICE Candidate: ${err.message}`, 'error');
+        addLog(`Error adding remote ICE candidate: ${err.message}`, 'error');
       }
     } else {
       pendingCandidates.current.push(candidate);
     }
   }, []);
 
-  const handleRoomFull = useCallback(({ roomCode }) => {
+  const handleRoomFull = useCallback(({ roomCode: fullRoom }) => {
     setStatus('full');
-    setErrorMsg(`Room ${roomCode} is full (max 2 users).`);
-    addLog(`Failed to join: Room ${roomCode} is full.`, 'error');
+    setErrorMsg(`Room ${fullRoom} is currently full (maximum 2 devices per room).`);
+    addLog(`Join rejected: Room ${fullRoom} is full.`, 'error');
   }, [addLog]);
 
   const handleServerErrorMsg = useCallback((msg) => {
     setErrorMsg(msg);
-    addLog(`Server error: ${msg}`, 'error');
-    setStatus((currentStatus) => {
-      if (currentStatus === 'joining') return 'disconnected';
-      return currentStatus;
-    });
+    addLog(`Server notice: ${msg}`, 'error');
+    setStatus((cur) => (cur === 'joining' ? 'disconnected' : cur));
   }, [addLog]);
 
   const handlePeerDisconnected = useCallback(() => {
     cleanupWebRTC();
     setStatus('joined-waiting');
-    addLog('Peer disconnected from room. Re-waiting for a new peer...', 'warning');
+    addLog('Peer left the room. Waiting for a new peer...', 'warning');
   }, [addLog]);
 
   const handleDisconnect = useCallback(() => {
     cleanupWebRTC();
-    addLog('Disconnected from signaling server.', 'warning');
-    setStatus('disconnected');
+    addLog('Signaling connection closed.', 'warning');
   }, [addLog]);
 
   const handleRoomClosed = useCallback(() => {
     cleanupWebRTC();
     setStatus('disconnected');
-    setErrorMsg('The host has disconnected. Room closed.');
-    addLog('The host disconnected. Room closed.', 'warning');
+    setErrorMsg('The room was closed by the host.');
+    addLog('Room closed.', 'warning');
   }, [addLog]);
 
-  // Instantiate Socket Signaling Hook
-  const socket = useSocket({
+  // Instantiate Socket Hook
+  const {
+    isConnected,
+    isWakingUp,
+    joinRoom: socketJoinRoom,
+    sendOffer: socketSendOffer,
+    sendAnswer: socketSendAnswer,
+    sendIceCandidate: socketSendIceCandidate,
+    sendRenegotiate,
+    leaveRoom: socketLeaveRoom
+  } = useSocket({
     onConnect: handleConnect,
     onConnectError: handleConnectError,
     onRoomJoined: handleRoomJoined,
@@ -179,11 +183,24 @@ export default function RoomConnection() {
     onErrorMsg: handleServerErrorMsg,
     onPeerDisconnected: handlePeerDisconnected,
     onDisconnect: handleDisconnect,
-    onRoomClosed: handleRoomClosed
+    onRoomClosed: handleRoomClosed,
+    onRenegotiate: () => {
+      if (roleRef.current === 'host') {
+        handleReady();
+      }
+    }
   });
-  socketRef.current = socket;
 
-  // Instantiate WebRTC connection manager Hook
+  socketRef.current = {
+    joinRoom: socketJoinRoom,
+    sendOffer: socketSendOffer,
+    sendAnswer: socketSendAnswer,
+    sendIceCandidate: socketSendIceCandidate,
+    sendRenegotiate,
+    leaveRoom: socketLeaveRoom
+  };
+
+  // Instantiate WebRTC Hook
   const {
     webrtcState,
     dataChannelStatus,
@@ -193,7 +210,8 @@ export default function RoomConnection() {
     pendingCandidates,
     initPeerConnection,
     cleanupWebRTC,
-    processPendingCandidates
+    processPendingCandidates,
+    restartIce
   } = useWebRTC({
     role,
     sendIceCandidate,
@@ -203,7 +221,7 @@ export default function RoomConnection() {
     onBufferedAmountLow: handleBufferedAmountLow
   });
 
-  // Instantiate File Transfer manager Hook
+  // Instantiate File Transfer Hook
   const fileTransfer = useFileTransfer({
     channelRef,
     addLog,
@@ -214,37 +232,49 @@ export default function RoomConnection() {
 
   const {
     fileQueue,
-    currentFileIndex,
     transferringFile,
     pendingIncomingFile,
     transferProgress,
     transferSpeed,
+    transferEta,
+    isPaused,
     addFilesToQueue,
+    removeFileFromQueue,
+    clearQueue,
+    handlePauseTransfer,
+    handleResumeTransfer,
     handleCancelTransfer,
     sendNextFileInQueue,
     handleAcceptFile,
     handleDeclineFile
   } = fileTransfer;
 
-  // UI Event Handlers
+  // Form submit
   const handleJoinSubmit = (e, codeToJoin) => {
     if (e && e.preventDefault) e.preventDefault();
-    const targetCode = codeToJoin || roomCode;
-    if (!/^\d{6}$/.test(targetCode)) {
+    const target = codeToJoin || roomCode;
+    if (!/^\d{6}$/.test(target)) {
       setErrorMsg('Please enter a valid 6-digit room code.');
       return;
     }
-    setRoomCode(targetCode);
+    setRoomCode(target);
     setErrorMsg('');
     setStatus('joining');
-    joinRoom(targetCode);
+    joinRoom(target);
   };
 
   const handleLeaveRoom = () => {
     leaveRoom();
-    window.location.reload();
+    cleanupWebRTC();
+    resetTransferStates();
+    setStatus('disconnected');
+    setRoleAndRef(null);
+    setJoinedRoomAndRef('');
+    setRoomCode('');
+    window.location.hash = '';
   };
 
+  // Drag and drop handlers
   const handleDragEvents = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -255,44 +285,42 @@ export default function RoomConnection() {
     }
   }, []);
 
-  const handleDropEvent = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      addFilesToQueue(Array.from(e.dataTransfer.files));
-    }
-  }, [addFilesToQueue]);
+  const handleDropEvent = useCallback(
+    (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragActive(false);
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        addFilesToQueue(Array.from(e.dataTransfer.files));
+      }
+    },
+    [addFilesToQueue]
+  );
 
-  const handleFileSelectEvent = useCallback((e) => {
-    if (e.target.files && e.target.files[0]) {
-      addFilesToQueue(Array.from(e.target.files));
-    }
-  }, [addFilesToQueue]);
+  const handleFileSelectEvent = useCallback(
+    (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        addFilesToQueue(Array.from(e.target.files));
+      }
+    },
+    [addFilesToQueue]
+  );
 
   return (
     <div className="connection-card">
       <div className="card-header">
-        <h2>Connection Settings</h2>
-        <p className="subtitle">Security & NAT Traversal</p>
+        <h2>P2P Transfer Room</h2>
+        <p className="subtitle">Zero-Storage • End-to-End Encrypted • Resumable</p>
       </div>
 
-      {isLegacyMode && status === 'ready' && (
-        <div className="error-alert warning-alert" style={{ background: 'rgba(245, 158, 11, 0.1)', border: '1px solid rgba(245, 158, 11, 0.2)', color: 'var(--color-warning)' }}>
-          <svg className="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
-          <span>Legacy mode active: Large files may cause memory limits.</span>
-        </div>
-      )}
-
-      <RoomJoinForm 
+      <RoomJoinForm
         onSubmit={handleJoinSubmit}
         roomCode={roomCode}
         setRoomCode={setRoomCode}
         status={status}
         errorMsg={errorMsg}
+        isWakingUp={isWakingUp && !isConnected}
+        onClearError={() => setErrorMsg('')}
       />
 
       <ConnectionStatus
@@ -306,54 +334,53 @@ export default function RoomConnection() {
       />
 
       {dataChannelStatus === 'open' && (
-        <div className="p2p-transfer-panel">
-          <h3>P2P File Transfer</h3>
-
+        <div className="p2p-transfer-panel" style={{ marginTop: '1.25rem' }}>
+          {/* Incoming transfer prompt (Accept / Resume / Decline) */}
           <IncomingRequestCard
             pendingIncomingFile={pendingIncomingFile}
             handleAcceptFile={handleAcceptFile}
             handleDeclineFile={handleDeclineFile}
           />
 
+          {/* Active progress status (both for sending & receiving) */}
           <TransferProgressCard
             transferringFile={transferringFile}
-            role={role}
-            currentFileIndex={currentFileIndex}
-            fileQueueLength={fileQueue.length}
             transferProgress={transferProgress}
             transferSpeed={transferSpeed}
+            transferEta={transferEta}
+            isPaused={isPaused}
+            handlePauseTransfer={handlePauseTransfer}
+            handleResumeTransfer={handleResumeTransfer}
             handleCancelTransfer={handleCancelTransfer}
           />
 
-          {role === 'host' ? (
-            <>
-              <FileDropZone
-                dragActive={dragActive}
-                handleDrag={handleDragEvents}
-                handleDrop={handleDropEvent}
-                handleFileSelect={handleFileSelectEvent}
-                transferringFile={transferringFile}
-              />
+          {/* Symmetric P2P Drop Zone: Active for BOTH peers */}
+          <FileDropZone
+            dragActive={dragActive}
+            handleDrag={handleDragEvents}
+            handleDrop={handleDropEvent}
+            handleFileSelect={handleFileSelectEvent}
+            transferringFile={transferringFile}
+          />
 
-              <FileQueueList
-                fileQueue={fileQueue}
-                transferringFile={transferringFile}
-                sendNextFileInQueue={sendNextFileInQueue}
-              />
-            </>
-          ) : (
-            !transferringFile && !pendingIncomingFile && (
-              <div className="receiver-waiting-card">
-                <div className="receiver-waiting-pulse"></div>
-                <p>Ready to receive files directly from peer...</p>
-              </div>
-            )
-          )}
+          {/* Selected files ready to be sent */}
+          <FileQueueList
+            fileQueue={fileQueue}
+            transferringFile={transferringFile}
+            sendNextFileInQueue={sendNextFileInQueue}
+            removeFileFromQueue={removeFileFromQueue}
+            clearQueue={clearQueue}
+          />
         </div>
       )}
 
       {(status === 'joined-waiting' || status === 'ready' || status === 'full') && (
-        <button onClick={handleLeaveRoom} className="btn-secondary" style={{ marginTop: '1rem' }}>
+        <button
+          type="button"
+          onClick={handleLeaveRoom}
+          className="btn-secondary"
+          style={{ marginTop: '1.5rem', width: '100%' }}
+        >
           Leave Room
         </button>
       )}

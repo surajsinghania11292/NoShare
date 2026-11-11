@@ -4,14 +4,24 @@ const PC_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' }
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelay',
+      credential: 'openrelay'
+    }
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy: 'max-bundle',
   rtcpMuxPolicy: 'require'
 };
 
-const BUFFER_LOW_THRESHOLD = 2 * 1024 * 1024; // 2MB buffer low water-mark for maximum pipeline flow
+const BUFFER_LOW_THRESHOLD = 256 * 1024; // 256KB safe low water-mark for reliable backpressure pacing
 
 export default function useWebRTC({
   role,
@@ -192,16 +202,28 @@ export default function useWebRTC({
     };
 
     if (currentRole === 'host') {
-      const channel = pc.createDataChannel('noshare-channel', { ordered: false, maxRetransmits: 0 });
+      const channel = pc.createDataChannel('noshare-channel', { ordered: true });
       setupDataChannel(channel);
     } else {
       pc.ondatachannel = (event) => {
-        addLog('Inbound RTCDataChannel received from Sender.', 'success');
+        addLog('Inbound RTCDataChannel established with peer.', 'success');
         setupDataChannel(event.channel);
       };
     }
 
     return pc;
+  };
+
+  const restartIce = async () => {
+    if (!pcRef.current) return;
+    try {
+      addLog('Initiating ICE restart to recover connection...', 'warning');
+      const offer = await pcRef.current.createOffer({ iceRestart: true });
+      await pcRef.current.setLocalDescription(offer);
+      return offer;
+    } catch (err) {
+      addLog(`ICE restart failed: ${err.message}`, 'error');
+    }
   };
 
   useEffect(() => {
@@ -219,6 +241,7 @@ export default function useWebRTC({
     pendingCandidates,
     initPeerConnection,
     cleanupWebRTC,
-    processPendingCandidates
+    processPendingCandidates,
+    restartIce
   };
 }

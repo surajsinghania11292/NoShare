@@ -150,26 +150,36 @@ function App() {
           {isGuideOpen && (
             <div className="info-drawer">
               <div className="info-drawer-title">
-                <span>How P2P Local Transfer Works</span>
+                <span>How NoShare P2P Transfer Works</span>
               </div>
               <div className="info-drawer-grid">
                 <div className="info-drawer-card">
                   <div className="info-card-header">
-                    <span className="info-badge-free">0 MB Data</span>
-                    <span>Direct Local Streaming</span>
+                    <span className="info-badge-free">Zero RAM Limits</span>
+                    <span>OPFS Disk Streaming</span>
                   </div>
                   <p className="info-card-desc">
-                    Files stream directly between devices over your local Wi-Fi router. Zero internet bandwidth is consumed to send your files.
+                    Files stream directly to sandboxed disk storage using Origin Private File System. Works smoothly on Linux, Windows, Mac, iOS, and Android without browser crashes.
                   </p>
                 </div>
 
                 <div className="info-drawer-card">
                   <div className="info-card-header">
-                    <span className="info-badge-warning">Required</span>
-                    <span>Same Wi-Fi Network</span>
+                    <span className="info-badge-free">Cross-Network</span>
+                    <span>Universal NAT Traversal</span>
                   </div>
                   <p className="info-card-desc">
-                    Both devices must be connected to the same Wi-Fi network. Connections across different networks (e.g. 4G to Wi-Fi) are blocked for security and privacy.
+                    Connect across local Wi-Fi, 4G/5G mobile cellular, or remote networks with automatic STUN and encrypted TURN relay fallbacks.
+                  </p>
+                </div>
+
+                <div className="info-drawer-card">
+                  <div className="info-card-header">
+                    <span className="info-badge-free">Smart Resume</span>
+                    <span>Zero Data Loss</span>
+                  </div>
+                  <p className="info-card-desc">
+                    If your connection drops, transfers pause and resume from the exact byte offset without having to start over from 0%.
                   </p>
                 </div>
               </div>

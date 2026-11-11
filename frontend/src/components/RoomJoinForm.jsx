@@ -1,23 +1,35 @@
 import React, { useState, useEffect } from 'react';
 
-export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, errorMsg }) {
+export default function RoomJoinForm({
+  onSubmit,
+  roomCode,
+  setRoomCode,
+  status,
+  errorMsg,
+  isWakingUp,
+  onClearError
+}) {
   const [mode, setMode] = useState('send'); // 'send' or 'receive'
 
-  // Generate a random 6-digit room code if Send is selected and room code is empty
   const generateRandomCode = () => {
     return Math.floor(100000 + Math.random() * 900000).toString();
   };
 
+  // Auto-detect room code from URL hash (e.g. #room=123456)
   useEffect(() => {
-    if (mode === 'send' && !roomCode) {
+    const hash = window.location.hash;
+    const match = hash.match(/room=(\d{6})/);
+    if (match && match[1]) {
+      setRoomCode(match[1]);
+      setMode('receive');
+    } else if (mode === 'send' && !roomCode) {
       setRoomCode(generateRandomCode());
-    } else if (mode === 'receive' && roomCode && !/^[0-9]{6}$/.test(roomCode)) {
-      // Keep or clear when switching
     }
-  }, [mode]);
+  }, []);
 
   const handleModeChange = (newMode) => {
     setMode(newMode);
+    onClearError?.();
     if (newMode === 'send') {
       setRoomCode(generateRandomCode());
     } else {
@@ -25,22 +37,18 @@ export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, 
     }
   };
 
-  if (status !== 'disconnected') return null;
+  if (status !== 'disconnected' && status !== 'joining') return null;
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (mode === 'send' && !roomCode) {
-      const newCode = generateRandomCode();
-      setRoomCode(newCode);
-      onSubmit(e, newCode, 'send');
-    } else {
-      onSubmit(e, roomCode, mode);
-    }
+    const targetCode = roomCode || generateRandomCode();
+    setRoomCode(targetCode);
+    onSubmit(e, targetCode, mode);
   };
 
   return (
     <div className="room-form-wrapper">
-      {/* Send / Receive Mode Selector Switcher */}
+      {/* Mode Selector */}
       <div className="mode-selector-tabs" role="tablist" aria-label="Transfer Mode">
         <button
           type="button"
@@ -52,7 +60,7 @@ export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, 
           <svg className="mode-tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
           </svg>
-          <span>Send</span>
+          <span>Share Files</span>
         </button>
 
         <button
@@ -65,11 +73,19 @@ export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, 
           <svg className="mode-tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
           </svg>
-          <span>Receive</span>
+          <span>Join / Receive</span>
         </button>
       </div>
 
       <form onSubmit={handleSubmit} className="connection-form">
+        {/* Server Cold-Start Warmup Banner */}
+        {isWakingUp && !errorMsg && (
+          <div className="info-alert" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.75rem 1rem', background: 'rgba(59, 130, 246, 0.08)', borderRadius: '12px', border: '1px solid rgba(59, 130, 246, 0.25)', marginBottom: '1rem', color: 'var(--color-primary)' }}>
+            <span className="spinner-small" style={{ width: '16px', height: '16px', border: '2px solid rgba(59, 130, 246, 0.3)', borderTopColor: 'var(--color-primary)', borderRadius: '50%', display: 'inline-block', animation: 'spin 1s linear infinite' }}></span>
+            <span style={{ fontSize: '0.85rem' }}>Connecting to signaling server... (Free-tier backend takes ~30s if waking up)</span>
+          </div>
+        )}
+
         {errorMsg && (
           <div className="error-alert">
             <svg className="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
@@ -82,7 +98,7 @@ export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, 
         {mode === 'send' ? (
           <div className="send-mode-details">
             <div className="room-code-preview-box">
-              <span className="room-code-label">Room Code for Peer:</span>
+              <span className="room-code-label">Your Private Room Code:</span>
               <div className="room-code-display-row">
                 <span className="room-code-digits">{roomCode || '------'}</span>
                 <button
@@ -99,11 +115,17 @@ export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, 
               </div>
             </div>
 
-            <button type="submit" className="btn-primary create-room-btn">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 5v14M5 12h14" />
-              </svg>
-              <span>Create Room</span>
+            <button type="submit" className="btn-primary create-room-btn" disabled={status === 'joining'}>
+              {status === 'joining' ? (
+                <span>Creating Room...</span>
+              ) : (
+                <>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
+                  <span>Create Room</span>
+                </>
+              )}
             </button>
           </div>
         ) : (
@@ -120,11 +142,17 @@ export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, 
                 className="room-code-input"
               />
             </div>
-            <button type="submit" className="btn-primary join-room-btn">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" />
-              </svg>
-              <span>Join Room</span>
+            <button type="submit" className="btn-primary join-room-btn" disabled={status === 'joining' || roomCode.length !== 6}>
+              {status === 'joining' ? (
+                <span>Connecting...</span>
+              ) : (
+                <>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" />
+                  </svg>
+                  <span>Join Room</span>
+                </>
+              )}
             </button>
           </div>
         )}
@@ -132,4 +160,3 @@ export default function RoomJoinForm({ onSubmit, roomCode, setRoomCode, status, 
     </div>
   );
 }
-
